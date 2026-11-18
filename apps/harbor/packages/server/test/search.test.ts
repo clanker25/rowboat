@@ -1,0 +1,326 @@
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { ensureMember } from '../src/auth.js';
+import { SpaceHub } from '../src/hub.js';
+import { PgStore } from '../src/pg-store.js';
+import { extractSearchText } from '../src/search.js';
+import { HarborService } from '../src/service.js';
+import type { SqlDb } from '../src/sql.js';
+import { pgliteDb } from '../src/sql-pglite.js';
+
+// Space search on real Postgres (migration 012): the GIN-backed queries, the
+// generated-column invariants (tombstone/edit reindex with zero code), query-
+// time mention expansion against the live roster, asset extraction, and the
+// boot backfill. Service-level on purpose — both faces are thin over search().
+
+let db: SqlDb;
+let store: PgStore;
+let service: HarborService;
+let spaceId: string;
+
+const ram = { memberId: 'ramnique' };
+const harsh = { memberId: 'harshv01' };
+
+beforeAll(async () => {
+  db = await pgliteDb();
+  store = new PgStore(db);
+  await store.init();
+  service = new HarborService(store, new SpaceHub(), { name: 'Search Org', address: 'search.test' });
+  await ensureMember(store, 'ramnique');
+  await store.putMember({ id: 'harshv01', displayName: 'Harsh Verma', kind: 'human' });
+  const space = await service.createSpace(ram, 'Search Space');
+  spaceId = space.id;
+  const invite = await service.createInvite(ram, { spaceId: spaceId });
+  await service.acceptInvite(harsh, invite.token);
+});
+
+afterAll(async () => {
+  await db.close();
+});
+
+describe('message search', () => {
+  it('ANDs words, prefix-matches the final term, returns newest first', async () => {
+    await service.postMessage(ram, spaceId, { body: 'The deploy pipeline is green again', actingMode: 'direct' });
+    await service.postMessage(ram, spaceId, { body: 'Deploy is blocked on the billing migration', actingMode: 'direct' });
+    await service.postMessage(ram, spaceId, { body: 'Lunch options thread', actingMode: 'direct' });
+
+    const both = await service.search(ram, spaceId, 'deploy');
+    expect(both.messages.map((m) => m.snippet)).toEqual([
+      'Deploy is blocked on the billing migration',
+      'The deploy pipeline is green again',
+    ]);
+
+    const anded = await service.search(ram, spaceId, 'deploy pipeline');
+    expect(anded.messages.length).toBe(1);
+    expect(anded.messages[0]!.snippet).toContain('pipeline');
+
+    // "pipe" (live typing) prefix-matches "pipeline"; "ploy" matches nothing.
+    expect((await service.search(ram, spaceId, 'pipe')).messages.length).toBe(1);
+    expect((await service.search(ram, spaceId, 'ploy')).messages.length).toBe(0);
+  });
+
+  it('expands member names to mention ids at query time — rename-safe', async () => {
+    const posted = await service.postMessage(ram, spaceId, {
+      body: 'hey @harshv01 can you review the invite flow?',
+      actingMode: 'direct',
+    });
+
+    // "harsh" is nobody's literal word in the body — it matches via the roster.
+    const byName = await service.search(ram, spaceId, 'harsh review');
+    expect(byName.messages.map((m) => m.messageId)).toContain(posted.message.id);
+    // Words of a multi-word display name resolve independently.
+    expect((await service.search(ram, spaceId, 'verma')).messages.length).toBe(1);
+
+    // Rename: the index never stored a name, so the new name works instantly
+    // and the old one stops matching.
+    await store.putMember({ id: 'harshv01', displayName: 'Hrsvrn', kind: 'human' });
+    expect((await service.search(ram, spaceId, 'hrsvrn review')).messages.length).toBe(1);
+    expect((await service.search(ram, spaceId, 'verma')).messages.length).toBe(0);
+    await store.putMember({ id: 'harshv01', displayName: 'Harsh Verma', kind: 'human' });
+  });
+
+  it('tombstones and edits reindex via the generated column, no code involved', async () => {
+    const posted = await service.postMessage(harsh, spaceId, { body: 'ephemeral zanzibar detail', actingMode: 'agent' });
+    expect((await service.search(ram, spaceId, 'zanzibar')).messages.length).toBe(1);
+
+    await service.editMessage(harsh, spaceId, posted.message.id, { body: 'ephemeral madagascar detail', actingMode: 'agent' });
+    expect((await service.search(ram, spaceId, 'zanzibar')).messages.length).toBe(0);
+    expect((await service.search(ram, spaceId, 'madagascar')).messages.length).toBe(1);
+
+    await service.deleteMessage(harsh, spaceId, posted.message.id, { actingMode: 'agent' });
+    expect((await service.search(ram, spaceId, 'madagascar')).messages.length).toBe(0);
+  });
+
+  it('joins thread + topic context at query time', async () => {
+    const root = await service.postMessage(ram, spaceId, { body: 'Quarterly kickoff agenda draft', actingMode: 'direct' });
+    const reply = await service.postMessage(harsh, spaceId, {
+      threadRoot: root.message.id,
+      body: 'agenda addendum: budget review',
+      actingMode: 'direct',
+    });
+    await service.createTopic(ram, spaceId, { rootMessageId: root.message.id, title: 'Q3 Kickoff', actingMode: 'direct' });
+
+    const hits = await service.search(ram, spaceId, 'agenda');
+    const replyHit = hits.messages.find((m) => m.messageId === reply.message.id);
+    expect(replyHit?.threadRootId).toBe(root.message.id);
+    expect(replyHit?.topicTitle).toBe('Q3 Kickoff');
+
+    // Topic titles are their own category.
+    const topicHits = await service.search(ram, spaceId, 'kickoff');
+    expect(topicHits.topics.map((t) => t.topic.title)).toContain('Q3 Kickoff');
+  });
+
+  it('finds a pasted URL, domain or file name, which Postgres indexes whole', async () => {
+    const root = await service.postMessage(ram, spaceId, { body: 'Release notes thread', actingMode: 'direct' });
+    const reply = await service.postMessage(harsh, spaceId, {
+      threadRoot: root.message.id,
+      body: 'see https://github.com/rowboatlabs/rowboat/pull/1297 and search.ts',
+      actingMode: 'direct',
+    });
+    const ids = async (q: string) => (await service.search(ram, spaceId, q)).messages.map((m) => m.messageId);
+
+    expect(await ids('https://github.com/rowboatlabs/rowboat/pull/1297')).toEqual([reply.message.id]);
+    expect(await ids('github.com/rowboatlabs/rowboat/pull/1297')).toEqual([reply.message.id]);
+    expect(await ids('github.com')).toEqual([reply.message.id]);
+    expect(await ids('search.ts')).toEqual([reply.message.id]);
+    // Other words still AND with the whole chunk.
+    expect(await ids('see github.com')).toEqual([reply.message.id]);
+    expect(await ids('lunch github.com')).toEqual([]);
+    // A different URL on the same host doesn't match.
+    expect(await ids('https://github.com/rowboatlabs/rowboat/pull/1')).toEqual([]);
+    // A path fragment alone still can't reach the whole lexeme (needs an index-side change).
+    expect(await ids('rowboatlabs')).toEqual([]);
+    // Punctuation-only chunks and quotes stay inert.
+    expect(await ids("-- o'neil.com")).toEqual([]);
+  });
+});
+
+describe('asset search', () => {
+  it('matches extracted content with a snippet, and filenames without one', async () => {
+    const { asset } = await service.createAsset(ram, spaceId, {
+      path: 'notes/roadmap.md',
+      newContent: '# Roadmap\nGardening agents ship in October.',
+      reason: 'seed',
+      actingMode: 'direct',
+    });
+
+    // Hits carry the id (what the agent acts on) next to the path (what it shows).
+    const byContent = await service.search(ram, spaceId, 'gardening');
+    expect(byContent.assets.length).toBe(1);
+    expect(byContent.assets[0]).toMatchObject({ id: asset.id, path: 'notes/roadmap.md', version: 1 });
+    expect(byContent.assets[0]!.snippet).toContain('Gardening');
+
+    const byName = await service.search(ram, spaceId, 'roadmap');
+    expect(byName.assets.map((a) => a.id)).toContain(asset.id);
+    expect(byName.assets.find((a) => a.id === asset.id)?.path).toBe('notes/roadmap.md');
+  });
+
+  it('indexes whiteboard text elements, never Excalidraw geometry JSON', async () => {
+    const board = JSON.stringify({
+      type: 'excalidraw',
+      elements: [
+        { type: 'rectangle', strokeColor: '#1e1e1e', width: 200 },
+        { type: 'text', text: 'Auth flow v2', strokeColor: '#1e1e1e' },
+        { type: 'frame', name: 'Login screens' },
+      ],
+    });
+    await service.createAsset(ram, spaceId, {
+      path: 'boards/auth.excalidraw',
+      newContent: board,
+      reason: 'board',
+      actingMode: 'direct',
+    });
+
+    expect((await service.search(ram, spaceId, 'auth flow')).assets.length).toBe(1);
+    expect((await service.search(ram, spaceId, 'login screens')).assets.length).toBe(1);
+    // Geometry noise is not searchable text.
+    const noise = await service.search(ram, spaceId, 'strokecolor');
+    expect(noise.assets.length).toBe(0);
+  });
+
+  it('follows renames and drops deleted files at query time — the index never moves', async () => {
+    const { asset } = await service.createAsset(ram, spaceId, {
+      path: 'scratch.md',
+      newContent: 'contains a very findable xylophone',
+      reason: 'seed',
+      actingMode: 'direct',
+    });
+    await service.moveAsset(ram, spaceId, {
+      assetId: asset.id,
+      toPath: 'archive/keep.md',
+      baseVersion: 1,
+      reason: 'tidy',
+      actingMode: 'direct',
+    });
+    const moved = await service.search(ram, spaceId, 'xylophone');
+    expect(moved.assets.map((a) => ({ id: a.id, path: a.path }))).toEqual([{ id: asset.id, path: 'archive/keep.md' }]);
+
+    await service.deleteAsset(ram, spaceId, { assetId: asset.id, baseVersion: 1, reason: 'done', actingMode: 'direct' });
+    expect((await service.search(ram, spaceId, 'xylophone')).assets.length).toBe(0);
+  });
+
+  it('boot backfill re-derives missing rows from asset heads', async () => {
+    await db.query('delete from asset_search', []);
+    expect((await service.search(ram, spaceId, 'gardening')).assets.length).toBe(0);
+    const filled = await store.backfillAssetSearch();
+    expect(filled).toBeGreaterThan(0);
+    expect((await service.search(ram, spaceId, 'gardening')).assets.length).toBe(1);
+  });
+});
+
+describe('across every space you are in (2026-11-09)', () => {
+  it('searches every space the caller is in when no space is given, each hit saying which; a stranger’s space is not searched', async () => {
+    const other = await service.createSpace(ram, 'Elsewhere');
+    await service.postMessage(ram, other.id, { body: 'shipping the elsewhere build', actingMode: 'direct' });
+    await service.postMessage(ram, spaceId, { body: 'shipping the main build', actingMode: 'direct' });
+    const everywhere = await service.search(ram, undefined, 'shipping', { kinds: ['messages'] });
+    expect(everywhere.messages.map((h) => h.spaceId).sort()).toEqual([other.id, spaceId].sort());
+    const one = await service.search(ram, spaceId, 'shipping', { kinds: ['messages'] });
+    expect(one.messages.map((h) => h.spaceId)).toEqual([spaceId]);
+    // Harsh is not in Elsewhere: his everywhere-search never reaches it.
+    const harshs = await service.search(harsh, undefined, 'shipping', { kinds: ['messages'] });
+    expect(harshs.messages.map((h) => h.spaceId)).toEqual([spaceId]);
+  });
+});
+
+describe('shape and scoping', () => {
+  it('honors kinds and per-category limit with truncated flags', async () => {
+    for (let i = 0; i < 4; i++) {
+      await service.postMessage(ram, spaceId, { body: `flamingo sighting number ${i}`, actingMode: 'direct' });
+    }
+    const capped = await service.search(ram, spaceId, 'flamingo', { limit: 2 });
+    expect(capped.messages.length).toBe(2);
+    expect(capped.truncated.messages).toBe(true);
+
+    const only = await service.search(ram, spaceId, 'flamingo', { kinds: ['assets'] });
+    expect(only.messages.length).toBe(0);
+    expect(only.assets.length).toBe(0);
+  });
+
+  it('refuses non-members and returns empty for a term-free query', async () => {
+    await ensureMember(store, 'outsider');
+    await expect(service.search({ memberId: 'outsider' }, spaceId, 'deploy')).rejects.toMatchObject({ code: 'forbidden' });
+    const empty = await service.search(ram, spaceId, '  ~~ !! ');
+    expect(empty.messages).toEqual([]);
+    expect(empty.truncated.messages).toBe(false);
+  });
+});
+
+describe('filters and word prefixes (2026-11-06)', () => {
+  let filterSpace: string;
+  const post = (who: { memberId: string }, body: string, threadRoot?: string) =>
+    service.postMessage(who, filterSpace, { body, ...(threadRoot ? { threadRoot } : {}), actingMode: 'direct' });
+
+  beforeAll(async () => {
+    filterSpace = (await service.createSpace(ram, 'Filter Space')).id;
+    const invite = await service.createInvite(ram, { spaceId: filterSpace });
+    await service.acceptInvite(harsh, invite.token);
+  });
+
+  it('prefix-matches every word, not only the last', async () => {
+    await post(ram, 'The deployment failed overnight');
+    expect((await service.search(ram, filterSpace, 'deploy fail')).messages.length).toBe(1);
+    expect((await service.search(ram, filterSpace, 'ploy fail')).messages.length).toBe(0);
+  });
+
+  it('from: and mentions: narrow in the store, and work without a word', async () => {
+    await post(harsh, 'quarterly numbers from harsh, see https://example.com/q3');
+    await post(ram, 'quarterly numbers for [@Harsh Verma](#member:harshv01)');
+
+    const fromHarsh = await service.search(ram, filterSpace, 'quarterly from:harsh');
+    expect(fromHarsh.messages.map((m) => m.author.memberId)).toEqual(['harshv01']);
+    // `me` is the searcher; a filter alone is a search.
+    const mine = await service.search(ram, filterSpace, 'from:me');
+    expect(mine.messages.every((m) => m.author.memberId === 'ramnique')).toBe(true);
+    expect(mine.messages.length).toBe(2);
+    const mentionsHarsh = await service.search(ram, filterSpace, 'mentions:harsh');
+    expect(mentionsHarsh.messages.map((m) => m.snippet)).toEqual(['quarterly numbers for [@Harsh Verma](#member:harshv01)']);
+    // A name nobody has matches nothing, rather than being ignored.
+    expect((await service.search(ram, filterSpace, 'quarterly from:nobody')).messages).toEqual([]);
+  });
+
+  it('has: matches links, images and files anywhere in the body', async () => {
+    await post(ram, 'screenshot ![shot](https://x/s/a/b/abc) attached');
+    await post(ram, 'the spec is [spec.pdf](https://x/s/a/b/def)');
+    const links = await service.search(ram, filterSpace, 'has:link');
+    expect(links.messages.length).toBe(3);
+    expect((await service.search(ram, filterSpace, 'has:image')).messages.map((m) => m.snippet)).toEqual([
+      'screenshot ![shot](https://x/s/a/b/abc) attached',
+    ]);
+    expect((await service.search(ram, filterSpace, 'has:file')).messages.map((m) => m.snippet)).toEqual([
+      'the spec is [spec.pdf](https://x/s/a/b/def)',
+    ]);
+  });
+
+  it("in: matches the thread's discussion or session title", async () => {
+    const planning = await post(ram, 'planning root');
+    await service.createTopic(ram, filterSpace, { rootMessageId: planning.message.id, title: 'Launch plan', actingMode: 'direct' });
+    await post(harsh, 'budget is approved', planning.message.id);
+    const session = await post(ram, 'session root');
+    await service.setSession(ram, filterSpace, session.message.id, { session: { title: 'Fix search' }, actingMode: 'direct' });
+    await post(harsh, 'budget for the search work', session.message.id);
+
+    expect((await service.search(ram, filterSpace, 'budget in:launch')).messages.map((m) => m.snippet)).toEqual(['budget is approved']);
+    expect((await service.search(ram, filterSpace, 'budget in:search')).messages.map((m) => m.snippet)).toEqual([
+      'budget for the search work',
+    ]);
+  });
+
+  it('a filtered query searches messages alone', async () => {
+    await service.createAsset(ram, filterSpace, { path: 'quarterly.md', newContent: 'quarterly', reason: 'seed', actingMode: 'direct' });
+    expect((await service.search(ram, filterSpace, 'quarterly')).assets.length).toBe(1);
+    const filtered = await service.search(ram, filterSpace, 'quarterly from:me');
+    expect(filtered.assets).toEqual([]);
+    expect(filtered.topics).toEqual([]);
+  });
+});
+
+describe('extractSearchText', () => {
+  it('passes prose through, strips generic JSON to string leaves', () => {
+    expect(extractSearchText('a.md', '# Hello world')).toBe('# Hello world');
+    const json = JSON.stringify({ title: 'Budget 2027', nested: { note: 'draft only', count: 7 } });
+    const out = extractSearchText('data.json', json);
+    expect(out).toContain('Budget 2027');
+    expect(out).toContain('draft only');
+    expect(out).not.toContain('count');
+  });
+});
