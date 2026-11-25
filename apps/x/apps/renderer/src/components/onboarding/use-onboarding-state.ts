@@ -1,0 +1,130 @@
+import { useState, useEffect, useCallback } from "react"
+import { toast } from "sonner"
+
+export interface ProviderState {
+  isConnected: boolean
+  isLoading: boolean
+  isConnecting: boolean
+}
+
+export function useOnboardingState(open: boolean, onComplete: () => void) {
+  // OAuth provider states (the Rowboat sign-in on Welcome)
+  const [providers, setProviders] = useState<string[]>([])
+  const [providersLoading, setProvidersLoading] = useState(true)
+  const [providerStates, setProviderStates] = useState<Record<string, ProviderState>>({})
+
+  useEffect(() => {
+    if (!open) return
+
+    async function loadProviders() {
+      try {
+        setProvidersLoading(true)
+        const result = await window.ipc.invoke('oauth:list-providers', null)
+        setProviders(result.providers || [])
+      } catch (error) {
+        console.error('Failed to get available providers:', error)
+        setProviders([])
+      } finally {
+        setProvidersLoading(false)
+      }
+    }
+    loadProviders()
+  }, [open])
+
+  const handleComplete = useCallback(() => {
+    onComplete()
+  }, [onComplete])
+
+  // Check connection status for all providers
+  const refreshAllStatuses = useCallback(async () => {
+    if (providers.length === 0) return
+
+    const newStates: Record<string, ProviderState> = {}
+
+    try {
+      const result = await window.ipc.invoke('oauth:getState', null)
+      const config = result.config || {}
+      for (const provider of providers) {
+        newStates[provider] = {
+          isConnected: config[provider]?.connected ?? false,
+          isLoading: false,
+          isConnecting: false,
+        }
+      }
+    } catch (error) {
+      console.error('Failed to check connection status for providers:', error)
+      for (const provider of providers) {
+        newStates[provider] = {
+          isConnected: false,
+          isLoading: false,
+          isConnecting: false,
+        }
+      }
+    }
+
+    setProviderStates(newStates)
+  }, [providers])
+
+  // Refresh statuses when modal opens or providers list changes
+  useEffect(() => {
+    if (open && providers.length > 0) {
+      refreshAllStatuses()
+    }
+  }, [open, providers, refreshAllStatuses])
+
+  // Listen for OAuth completion events (state updates only — toasts handled by ConnectorsPopover)
+  useEffect(() => {
+    const cleanup = window.ipc.on('oauth:didConnect', (event) => {
+      const { provider, success } = event
+
+      setProviderStates(prev => ({
+        ...prev,
+        [provider]: {
+          isConnected: success,
+          isLoading: false,
+          isConnecting: false,
+        }
+      }))
+    })
+
+    return cleanup
+  }, [])
+
+  const startConnect = useCallback(async (provider: string) => {
+    setProviderStates(prev => ({
+      ...prev,
+      [provider]: { ...prev[provider], isConnecting: true }
+    }))
+
+    try {
+      const result = await window.ipc.invoke('oauth:connect', { provider })
+
+      if (!result.success) {
+        toast.error(result.error || `Failed to connect to ${provider}`)
+        setProviderStates(prev => ({
+          ...prev,
+          [provider]: { ...prev[provider], isConnecting: false }
+        }))
+      }
+    } catch (error) {
+      console.error('Failed to connect:', error)
+      toast.error(`Failed to connect to ${provider}`)
+      setProviderStates(prev => ({
+        ...prev,
+        [provider]: { ...prev[provider], isConnecting: false }
+      }))
+    }
+  }, [])
+
+  return {
+    // OAuth state
+    providers,
+    providersLoading,
+    providerStates,
+    startConnect,
+
+    handleComplete,
+  }
+}
+
+export type OnboardingState = ReturnType<typeof useOnboardingState>

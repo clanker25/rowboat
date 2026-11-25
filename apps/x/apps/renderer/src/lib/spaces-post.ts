@@ -1,0 +1,81 @@
+import { canActInSpace } from '@/lib/spaces-access'
+import { invokeSpace } from '@/lib/spaces-invoke'
+import type { spaces } from '@x/shared'
+import type { OrgWithSpaces } from '@/hooks/use-spaces'
+import { buildPendingMessage, failPendingStreamMessage, ingestStreamMessage, resolvePendingStreamMessage } from '@/hooks/use-space-chat'
+import { markStreamRead, noteThread } from '@/lib/spaces-read-state'
+import { maybeInvokeRowboat, type RowboatTurnOptions } from '@/lib/spaces-rowboat'
+import { threadLabelOf } from '@/lib/spaces-conventions'
+import { containsRowboatAddress } from '@/lib/spaces-mentions'
+import * as analytics from '@/lib/analytics'
+import { noteInvocations } from '@/hooks/use-space-invocations'
+
+/** Options picked in the composer for agent members a message mentions, by agent id (Harbor spec §8, 2026-09-30). */
+export type AgentMemberOptions = Record<string, Record<string, string | boolean>>
+
+/** A secret for the members the message mentions (Harbor spec §8, 2026-11-04). */
+export type MessageSecretInput = { name: string; value: string }
+
+/** The post payload's share of them, and of the secrets: nothing when none were picked. */
+export function agentOptionsPayload(agent: { members?: AgentMemberOptions; secrets?: MessageSecretInput[] } | undefined): { agentOptions?: AgentMemberOptions; secrets?: MessageSecretInput[] } {
+    return {
+        ...(agent?.members && Object.keys(agent.members).length > 0 ? { agentOptions: agent.members } : {}),
+        ...(agent?.secrets && agent.secrets.length > 0 ? { secrets: agent.secrets } : {}),
+    }
+}
+
+// Posting a ROOT to a space's stream, the optimistic way (standard team-chat
+// pattern): the row renders the moment this is called, dimmed as pending; the
+// org's write confirms, or fails into a retry/discard row, in the background.
+// Lifted out of GeneralStream (2026-09-23) so the thread pane's "post to the
+// stream instead" lands exactly what the stream composer would have. Callers
+// on a detached window snap to the tail first (jumpToLatest), or the row has
+// no tail to land on.
+export function postStreamMessage(org: OrgWithSpaces, space: spaces.Space, body: string, agent?: RowboatTurnOptions & { members?: AgentMemberOptions; secrets?: MessageSecretInput[] }): void {
+    if (!canActInSpace(org.id, space.id)) return
+    const pending = buildPendingMessage(space.id, org.memberId, body)
+    ingestStreamMessage(org.id, space.id, pending)
+    void invokeSpace('spaces:postMessage', { orgId: org.id, spaceId: space.id, body, ...agentOptionsPayload(agent) })
+        .then((result) => {
+            resolvePendingStreamMessage(org.id, space.id, pending.id, result.message)
+            noteInvocations(org.id, space.id, result.invocations)
+            // The org read the stream up to our own post; mirror it.
+            markStreamRead(org.id, space.id, result.message.offset, { sync: false })
+            analytics.spacesMessagePosted({ kind: 'general', mentionsRowboat: containsRowboatAddress(body) })
+            // @rowboat on a fresh stream message: the agent works the thread
+            // under it, its receipt lands as the first reply.
+            maybeInvokeRowboat(org, space, { rootMessageId: result.message.id, label: threadLabelOf(body) }, result.message.id, body, agent)
+        })
+        .catch(() => {
+            failPendingStreamMessage(org.id, space.id, pending.id, body)
+        })
+}
+
+// A reply sent from the inline view (2026-10-25): it lands in the stream the
+// same optimistic way, and in its thread on the org. Replying follows the
+// thread and reads it up to the reply (the org's rule); mirrored here.
+// peopleOnly is the follow-up line's × (Harbor spec §8, 2026-10-29).
+export function postInlineReply(
+    org: OrgWithSpaces,
+    space: spaces.Space,
+    thread: { rootMessageId: string; label: string },
+    body: string,
+    agent?: RowboatTurnOptions & { members?: AgentMemberOptions; secrets?: MessageSecretInput[] },
+    peopleOnly?: boolean,
+): void {
+    if (!canActInSpace(org.id, space.id)) return
+    const pending = buildPendingMessage(space.id, org.memberId, body, thread.rootMessageId)
+    ingestStreamMessage(org.id, space.id, pending)
+    void invokeSpace('spaces:postMessage', { orgId: org.id, spaceId: space.id, threadRoot: thread.rootMessageId, body, ...agentOptionsPayload(agent), ...(peopleOnly ? { peopleOnly: true } : {}) })
+        .then((result) => {
+            resolvePendingStreamMessage(org.id, space.id, pending.id, result.message)
+            noteInvocations(org.id, space.id, result.invocations)
+            noteThread(org.id, space.id, thread.rootMessageId, { following: true, readOffset: result.message.offset, lastReplyOffset: result.message.offset })
+            analytics.spacesMessagePosted({ kind: 'topic', mentionsRowboat: containsRowboatAddress(body) })
+            maybeInvokeRowboat(org, space, thread, result.message.id, body, agent)
+        })
+        .catch(() => {
+            failPendingStreamMessage(org.id, space.id, pending.id, body)
+        })
+}
+
